@@ -48,7 +48,10 @@ class FirstShotModel(nn.Module):
     ) -> None:
 
         super(FirstShotModel, self).__init__()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.has_mps else "cpu")
+        # self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")# "mps" if torch.has_mps else "cpu")
+
+        print(f"1st Shot Model Device: {self.device}")
 
         self.embedding_model = embedding_model
         self.normalize_embeddings = normalize_embeddings
@@ -115,15 +118,21 @@ class FirstShotModel(nn.Module):
 class ZeroBERToDataSelector:
     def __init__(self, selection_strategy="top_n"):
         self.selection_strategy = selection_strategy
+        self.keep_training = True
 
-    def __call__(self, text_list, probabilities, embeddings, labels=None, n=8, discard_indices = [], selection_strategy=None):
+    def __call__(self, text_list, probabilities, embeddings, labels=None, n=8, discard_indices = [], selection_strategy=None,min_cluster_size=10,leaf_size=20):
         if not selection_strategy:
             selection_strategy = self.selection_strategy
-        if selection_strategy == "top_n":
+        if selection_strategy == 'first_shot':
+            return self._clusterer_fit_predict('hdbscan',embeddings,leaf_size,min_cluster_size)
+        if selection_strategy == "top_n" or selection_strategy == "tn" :
             return self._get_top_n_data(text_list, probabilities, labels, n, discard_indices)
-        if selection_strategy == "intraclass_clustering":
+        if selection_strategy == "intraclass_clustering" or selection_strategy == 'ic':
             return self._get_intraclass_clustering_data(text_list, probabilities, labels, embeddings, n, discard_indices)
-
+    # def _get_first_shot_roadmap(self, clusterer, embeddings, leaf_size, min_cluster_size):
+    #     clusters = self._clusterer_fit_predict(clusterer,embeddings,leaf_size,min_cluster_size)
+    #     print(len(clusters))
+    #     return clusters
     def _get_top_n_data(self, text_list, probs,labels,n,discard_indices = []):
         # QUESTION: está certo ou deveria pegar os top n de cada classe? faz diferença?
         # Aqui permite que o mesmo exemplo entre para duas classes
@@ -154,7 +163,7 @@ class ZeroBERToDataSelector:
     
     def _get_intraclass_clustering_data(self, text_list, probabilities, true_labels, embeddings, n, discard_indices = [],
                                          clusterer='hdbscan', leaf_size=20, min_cluster_size=10):
-
+        self.keep_training = True
         discard_indices = set(discard_indices)
         prob_results, label_results = torch.max(probabilities, axis=-1)
 
@@ -165,7 +174,7 @@ class ZeroBERToDataSelector:
             # Retrieve indices for label
             label_indices = (label_results == label).nonzero().squeeze()
             if len(label_indices) < n:
-                print(f"Not enough data to sample for label {label}: {n} samples expected, but only got {len(label_indexes)}")
+                print(f"Not enough data to sample for label {label}: {n} samples expected, but only got {len(label_indices)}")
                 # Throws error
                 break
 
@@ -176,9 +185,13 @@ class ZeroBERToDataSelector:
 
             label_clusters = self._clusterer_fit_predict(clusterer, label_embeddings, leaf_size, min_cluster_size) 
 
-            unique_clusters = list(set(label_clusters))
+            unique_clusters = list(set(label_clusters.tolist()))
+            # print("Unique clusters:")
+            # print(unique_clusters)
             unique_clusters.sort() # Here should be sorted by density, no? - TO DO
-
+            # print("Sorted clusters:")
+            # print(unique_clusters)
+            
             clustered_docs = {}
 
             # sort docs by probabilities for each cluster found
@@ -189,6 +202,7 @@ class ZeroBERToDataSelector:
                 cluster_indices = cluster_indices[cluster_probs_sorted_ind]
 
                 clustered_docs[cluster] = [item for item in cluster_indices.tolist() if item not in discard_indices]
+                # print("Clustered docs:",clustered_docs)
 
             # selects data iteratively, 1 from each cluster from biggest to smallest cluster, 
             # following highest probability order inside each cluster
@@ -209,7 +223,7 @@ class ZeroBERToDataSelector:
         labels_train = [true_labels[i] for i in selected_data]
         probs_train = [probabilities[i] for i in selected_data]
 
-        print(list(zip(y_train,labels_train)))
+        # print(list(zip(y_train,labels_train)))
         return x_train, y_train, labels_train, selected_data, probs_train
 
     def _clusterer_fit_predict(self,clusterer,embeddings,leaf_size,min_cluster_size):
@@ -218,7 +232,10 @@ class ZeroBERToDataSelector:
         embeds = torch.Tensor(embeddings).cpu()
         clusters = clusterer_model.fit_predict(embeds)
         # logger.info("Found {} clusters.".format(len(list(set(clusters)))))
-        print(f"Found {len(list(set(clusters)))} clusters.")
+        num_of_clusters = len(list(set(clusters)))
+        # if num_of_clusters!= 1:
+        #     self.keep_training = True
+        print(f"Found {num_of_clusters} clusters.")
         return torch.IntTensor(clusters)
 
     # def _get_intraclass_clustering_data(self,text_list,probabilities,labels,n)
@@ -235,13 +252,14 @@ class ZeroBERToModel(SetFitModel):
             multi_target_strategy: Optional[str] = None,
             l2_weight: float = 1e-2,
             normalize_embeddings: bool = False,
+            model_id: str = None,
     ) -> None:
         super(ZeroBERToModel, self).__init__(model_body,model_head,multi_target_strategy,l2_weight,normalize_embeddings)
 
         # If you don't give a first shot model, we use the body - TO REVIEW
         #if not first_shot_model:
             #first_shot_model = model_body
-
+        self.model_id = model_id
         self.first_shot_model = first_shot_model
 
     @classmethod
@@ -265,8 +283,10 @@ class ZeroBERToModel(SetFitModel):
             **model_kwargs,
     ) -> "ZeroBERToModel":
         model_body = SentenceTransformer(model_id, cache_folder=cache_dir, use_auth_token=use_auth_token)
-        target_device = model_body._target_device
-        model_body.to(target_device)  # put `model_body` on the target device
+        target_device = 'mps' if torch.has_mps else model_body._target_device
+                # model_body.to(target_device)  # put `model_body` on the target device
+        model_body.to(target_device)
+        print(f"ZeroBERTo Body device: {target_device}")
 
         if os.path.isdir(model_id):
             if MODEL_HEAD_NAME in os.listdir(model_id):
@@ -347,7 +367,8 @@ class ZeroBERToModel(SetFitModel):
                 s_transf_first_shot = SentenceTransformer(first_shot_model_id,
                                                         cache_folder=cache_dir,
                                                         use_auth_token=use_auth_token)
-                target_device = s_transf_first_shot._target_device
+                target_device = "mps" if torch.has_mps else s_transf_first_shot._target_device
+                print(f"1st shot moved to {target_device}")
                 s_transf_first_shot.to(target_device)  # put `first_shot_model` on the target device
             else:
                 s_transf_first_shot = model_body
@@ -359,19 +380,20 @@ class ZeroBERToModel(SetFitModel):
             first_shot_model = None
 
   
-
+        
         return cls(
             model_body=model_body,
             first_shot_model=first_shot_model,
             model_head=model_head,
             multi_target_strategy=multi_target_strategy,
             normalize_embeddings=normalize_embeddings,
+            model_id=model_id,
         )
 
     def reset_model_head(self, **model_kwargs):
         head_params = model_kwargs.get("head_params", {})
-        target_device = self.model_body._target_device
-
+        target_device = "mps" if torch.has_mps else self.model_body._target_device
+        # print(f"Head reset and moved to {target_device}.")
         if type(self.model_head) is SetFitHead: #use_differentiable_head
             if self.multi_target_strategy is None:
                 use_multitarget = False
@@ -409,11 +431,15 @@ class ZeroBERToModel(SetFitModel):
         self.model_head = model_head
 
 
-    ## TO DO: REFAZER
-    def reset_model_body(self,model_body):
-        print(f"Reset Model body to checkpoint.")
-        self.model_body = model_body
-        self.model_body.to(("cuda" if torch.cuda.is_available() else "cpu"))
+    ## TO DO: revisar
+    def reset_model_body(self):
+        self.model_body =  SentenceTransformer(self.model_id)
+        target_device = ("cuda" if torch.cuda.is_available() else "mps" if torch.has_mps else "cpu")
+        self.model_body.to(target_device)
+        print(f"Reset Model body to '{self.model_id}' checkpoint and moved to {target_device}.")
+
+        # no from_pretrained ele passa o model_id
+        # salvar como self.model_id e pegar aq
         
 
 

@@ -82,10 +82,10 @@ def arg_parse() -> argparse.Namespace:
         "--learning_rate", type=float,  default=2e-5
     )
     parser.add_argument(
-        "--body_learning_rate", type=float, default=2e-5
+        "--body_learning_rate", type=float, default=1e-6
     )
     parser.add_argument(
-        "--num_body_epochs", type=int, default=1
+        "--num_body_epochs", type=int, default=2
     )
     parser.add_argument(
         "--freeze_head",help="If True, will train head.", default=False,action=argparse.BooleanOptionalAction
@@ -99,8 +99,24 @@ def arg_parse() -> argparse.Namespace:
     parser.add_argument(
         "--allow_resampling",help="If True, will not discard training data on subsequent iterations.", default=False,action=argparse.BooleanOptionalAction
     )              
-         
-
+    parser.add_argument(
+        "--random_seed",help="Integer as random seed for dataset sampling.", default=42,type=int
+    )
+    parser.add_argument(
+        "--train_dataset_size",help="number of unlabeled samples to take as train dataset", default=5000,type=int
+    ) 
+    parser.add_argument(
+        "--auto",help="If True, will automatically set hyperparameters.", default=False,action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--growth_rate",help="The multiplier on n for each iteration", default=2,type=int
+    ) 
+    parser.add_argument(
+        "--growth_threshold",help="The margin for stopping the training procedure", default=0.05,type=float
+    ) 
+    parser.add_argument(
+        "--starting_n",help="The margin for stopping the training procedure", default=8,type=int
+    )
     args = parser.parse_args()
     return args
 
@@ -111,14 +127,20 @@ def main():
 
     # Open the dataset
     dataset = load_dataset(args.dataset)
-    train_dataset = dataset[args.dataset_train_split].shuffle(seed=42).select(range(0,min(len(dataset[args.dataset_train_split]), 5000)))
+    train_dataset_size = min(len(dataset[args.dataset_train_split]), args.train_dataset_size)
+    # print(f"Train dataset size: {train_dataset_size}")
+    random_seed = args.random_seed
+    train_dataset = dataset[args.dataset_train_split].shuffle(seed=random_seed).select(range(0,train_dataset_size))
     # args.dataset_test_split = "test" # TO DO remove
     test_dataset = dataset[args.dataset_test_split]#.select(range(0,200))
-
+    growth_rate = args.growth_rate
+    growth_threshold = args.growth_threshold
+    starting_n = args.starting_n
     # Define experiment name
     dataset_name = args.dataset.split("/")[-1]
     current_dateTime = str(datetime.now())
     experiment_name = dataset_name+"_"+ current_dateTime
+    experiment_hyperparameters_name = dataset_name+"_hyperparameters_"+current_dateTime
 
 
     if args.dataset=='SetFit/sst2':
@@ -201,6 +223,20 @@ def main():
     data_selector = ZeroBERToDataSelector(selection_strategy=args.selection_strategy)
 
     print("Start training")
+    
+    if args.auto:
+        var_samples_per_label = [8, 16, 32, 48, 64, 128]
+        var_selection_strategy = ['top_n', 'intraclass_clustering','top_n', 'intraclass_clustering','top_n', 'top_n']
+        num_setfit_iterations = 6
+        train_first_shot = True
+    else:
+        var_samples_per_label = None
+        var_selection_strategy = None
+        num_setfit_iterations = None
+        train_first_shot = None
+
+
+
 
     # Build trainer
     trainer = ZeroBERToTrainer(
@@ -210,26 +246,64 @@ def main():
         eval_dataset=test_dataset,
         metric=compute_metrics_fn,
         loss_class=CosineSimilarityLoss,
-        num_iterations=args.num_iterations,
-        num_setfit_iterations=args.num_setfit_iterations,
+        num_iterations=  args.num_iterations,
+        num_setfit_iterations=num_setfit_iterations or args.num_setfit_iterations,
         num_epochs=args.num_epochs,
-        seed=42,
+        seed=random_seed,
         column_mapping=dataset_column_mapping,
         samples_per_label=args.samples_per_label,
         batch_size=args.batch_size,
-        var_samples_per_label=args.var_samples_per_label,
-        var_selection_strategy=args.var_selection_strategy,
+        var_samples_per_label=var_samples_per_label or args.var_samples_per_label,
+        var_selection_strategy=var_selection_strategy or args.var_selection_strategy,
         learning_rate=args.learning_rate,
         body_learning_rate=args.body_learning_rate,
         freeze_head=args.freeze_head,
         freeze_body=args.freeze_body,
-        train_first_shot = args.train_first_shot,
+        train_first_shot = train_first_shot or args.train_first_shot,
         allow_resampling=args.allow_resampling,
-        experiment_name=experiment_name
-
+        experiment_name=experiment_name,
+        growth_rate=growth_rate,
+        growth_threshold = growth_threshold,
+        starting_n = starting_n,
+        selection_strategy=args.selection_strategy
     )
 
+    hyperparameters = {}
+    hyperparameters['model_name_or_path'] = args.model_name_or_path
+    hyperparameters['dataset'] = args.dataset
+    hyperparameters['train_dataset_size'] = train_dataset_size
+    hyperparameters['random_seed'] = random_seed
+    hyperparameters['dataset_train_split'] = args.dataset_train_split
+    hyperparameters['dataset_test_split'] = args.dataset_test_split
+    hyperparameters['hypothesis_template'] = args.hypothesis_template
+    hyperparameters['multi_target_strategy'] = args.multi_target_strategy
+    hyperparameters['use_differentiable_head'] = args.use_differentiable_head
+    hyperparameters['num_iterations'] = args.num_iterations
+    hyperparameters['num_setfit_iterations'] = num_setfit_iterations or args.num_setfit_iterations
+    hyperparameters['num_epochs'] = args.num_epochs
+    hyperparameters['samples_per_label'] = args.samples_per_label
+    hyperparameters['normalize_embeddings'] = args.normalize_embeddings
+    hyperparameters['selection_strategy'] = args.selection_strategy
+    hyperparameters['batch_size'] = args.batch_size
+    hyperparameters['var_samples_per_label'] = var_samples_per_label or args.var_samples_per_label
+    hyperparameters['var_selection_strategy'] = var_selection_strategy or args.var_selection_strategy
+    hyperparameters['learning_rate'] = args.learning_rate
+    hyperparameters['body_learning_rate'] = args.body_learning_rate
+    hyperparameters['num_body_epochs'] = args.num_body_epochs
+    hyperparameters['freeze_head'] = args.freeze_head
+    hyperparameters['freeze_body'] = args.freeze_body
+    hyperparameters['train_first_shot'] = train_first_shot or args.train_first_shot
+    hyperparameters['allow_resampling'] = args.allow_resampling
+    hyperparameters['growth_rate'] = growth_rate
+    hyperparameters['growth_threshold'] = growth_threshold
+    hyperparameters['starting_n'] = starting_n
+
+
+    print(hyperparameters)
     # Body training
+
+    with open(experiment_hyperparameters_name+".json", "w") as final:
+        json.dump(hyperparameters, final)
 
     train_history = trainer.train(return_history=True)
     print(train_history)
@@ -237,9 +311,10 @@ def main():
     with open(experiment_name+".json", "w") as final:
         json.dump(train_history, final)
 
+
     # Evaluate
-    final_metrics = trainer.evaluate()
-    print(final_metrics)
+    # final_metrics = trainer.evaluate()
+    # print(final_metrics)
 
 
 if __name__ == '__main__':

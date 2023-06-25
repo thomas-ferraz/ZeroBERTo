@@ -62,6 +62,11 @@ class ZeroBERToTrainer(SetFitTrainer):
             train_first_shot: bool = False,
             allow_resampling: bool = False,
             experiment_name: str = "training_zeroberto",
+            growth_rate: int = 2,
+            starting_n: int = 8,
+            growth_threshold: float = 0.05,
+            selection_strategy: str = 'top_n'
+
 
     ):
         if (warmup_proportion < 0.0) or (warmup_proportion > 1.0):
@@ -94,9 +99,13 @@ class ZeroBERToTrainer(SetFitTrainer):
         self.train_first_shot = train_first_shot
         self.allow_resampling = allow_resampling
         self.experiment_name = experiment_name
+        self.growth_rate = growth_rate
+        self.starting_n = starting_n
+        self.selection_strategy = selection_strategy
+        self.growth_threshold = growth_threshold
 
-        if self.var_samples_per_label is not None:
-            assert len(var_samples_per_label) == num_setfit_iterations, "num_setfit_iterations and length of var_samples_per_label must match"
+        # if self.var_samples_per_label is not None:
+        #     assert len(var_samples_per_label) == num_setfit_iterations, "num_setfit_iterations and length of var_samples_per_label must match"
             # print("Asserting: len(var_samples) = ",len(var_samples_per_label))
         if model is None:
             if model_init is not None:
@@ -135,6 +144,10 @@ class ZeroBERToTrainer(SetFitTrainer):
             allow_resampling: bool = False,
             update_embeddings: bool = False,
             train_first_shot: bool = False,
+            growth_rate: int = 2,
+            growth_threshold: float = 0.05,
+            starting_n: int = 8,
+
     ):
         """
         Main training entry point.
@@ -176,9 +189,10 @@ class ZeroBERToTrainer(SetFitTrainer):
         self._validate_column_mapping(self.train_dataset)
         train_dataset = self.train_dataset
         eval_dataset = self.eval_dataset
+        growth_threshold = self.growth_threshold or growth_threshold
 
         if self.column_mapping is not None:
-            logger.info("Applying column mapping to training dataset")
+            # logger.info("Applying column mapping to training dataset")
             train_dataset = self._apply_column_mapping(self.train_dataset, self.column_mapping)
             if eval_dataset:
                 eval_dataset = self._apply_column_mapping(self.eval_dataset, self.column_mapping)
@@ -245,11 +259,11 @@ class ZeroBERToTrainer(SetFitTrainer):
                 num_body_epochs = last_shot_body_epochs or num_epochs
                 total_train_steps = len(train_dataloader) * (num_body_epochs or num_epochs)
                 body_lr = last_shot_body_learning_rate or body_learning_rate
-                print("** Training body **")
-                print(f"Num examples = {len(train_examples)}")
-                print(f"Num body epochs = {num_body_epochs}")
-                print(f"Total optimization steps = {total_train_steps}")
-                print(f"Total train batch size = {setfit_batch_size}")
+                # print("** Training body **")
+                # print(f"Num examples = {len(train_examples)}")
+                # print(f"Num body epochs = {num_body_epochs}")
+                # print(f"Total optimization steps = {total_train_steps}")
+                # print(f"Total train batch size = {setfit_batch_size}")
 
                 warmup_steps = math.ceil(total_train_steps * self.warmup_proportion)
                 self.model.model_body.fit(
@@ -264,8 +278,8 @@ class ZeroBERToTrainer(SetFitTrainer):
             if not self.model.has_differentiable_head or not self._freeze or not self.freeze_head:
                 # Train the final classifier
                 num_head_epochs = last_shot_head_epochs or num_epochs
-                print("** Training head **")
-                print(f"Num epochs = {num_head_epochs}")
+                # print("** Training head **")
+                # print(f"Num head epochs = {num_head_epochs}")
 
                 self.model.fit(
                     x_train,
@@ -279,7 +293,6 @@ class ZeroBERToTrainer(SetFitTrainer):
                 )
 
         training_history = []
-
         # Check if there is labels
         labels = train_dataset["label"] if "label" in train_dataset.features else None
         eval_labels = eval_dataset["label"] if "label" in eval_dataset.features else None
@@ -288,57 +301,91 @@ class ZeroBERToTrainer(SetFitTrainer):
         print(f"Running First-Shot on {len(train_dataset['text'])} documents.")
         t0 = time.time()
 
-        if self.model.first_shot_model and self.train_first_shot:
-            x_train, y_train = self._build_first_shot_dataset()
-            train_setfit_iteration(last_shot_body_epochs=5)
-            trained_probs, fs_trained_embeds = self.model.predict_proba(train_dataset["text"], return_embeddings=True)
-            print(f"1st shot - train and prediction time: {round(time.time()-t0,2)} seconds")
-
-            # TO DO: if demanded and train_dataset["label"], report metrics on the performance of the model on train set
-            if return_history and labels:
-                y_pred = torch.argmax(trained_probs, axis=-1)
-                current_metric = {f"full_train_trained_first_shot:":self._predict_metrics(y_pred, labels)}
-                print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-                training_history.append(current_metric)
-                if eval_dataset and eval_labels:
-                    test_embeds, test_probs = self.model.predict_proba(eval_dataset["text"], return_embeddings=True)
-                    y_pred = torch.argmax(test_probs, axis=-1)
-                    current_metric = {f"eval_trained_first_shot": self._predict_metrics(y_pred, eval_dataset["label"])}
-                    print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-                    training_history.append(current_metric)
-                    saving_tuple = (fs_trained_embeds, trained_probs, labels, test_embeds, test_probs, eval_dataset["label"])
-                    with open("dim_" + self.experiment_name + "_" + "full_train_trained_first_shot" + '.pickle', 'wb') as handle:
-                        pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            # probs, embeds = self.model.first_shot_model(train_dataset["text"], return_embeddings=True)
-
         if self.model.first_shot_model:
             raw_probs, embeds, original_logits = self.model.first_shot_model(train_dataset["text"], return_embeddings=True, return_logits=True)
+            max_probs = ([max(probs) for probs in raw_probs])
+            last_mean = torch.mean(torch.stack(max_probs))
+            last_std = torch.std(torch.stack(max_probs))
+
+            print("mean:",float(last_mean),"-- std:",float(last_std))
             print(f"1st shot - cosine product time: {round(time.time()-t0,2)} seconds")
-            # TO DO: if demanded and train_dataset["label"], report metrics on the performance of the model
+            # self.data_selector(None, None, embeds,selection_strategy='first_shot')            
+            # # TO DO: if demanded and train_dataset["label"], report metrics on the performance of the model
             if return_history and labels:
                 y_pred = torch.argmax(raw_probs, axis=-1)
                 _, label_embeds = self.model.first_shot_model(self.model.first_shot_model.classes_list, return_embeddings=True)
                 current_metric = {"full_train_raw_first_shot":self._predict_metrics(y_pred, labels), "unsup_full_train_raw_first_shot":self.unsup_evaluator(embeds, raw_probs, label_embeds, original_logits)}
                 print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-                print(list(current_metric.keys())[1], "----- ",current_metric[list(current_metric.keys())[1]])
+                # print(list(current_metric.keys())[1], "----- ",current_metric[list(current_metric.keys())[1]])
                 training_history.append(current_metric)
                 if eval_dataset and eval_labels:
                     test_probs, test_embeds, test_original_logits = self.model.first_shot_model(eval_dataset["text"], return_embeddings=True, return_logits=True)
+                    max_probs = ([max(probs) for probs in test_probs])
+                    print("mean:",float(torch.mean(torch.stack(max_probs))),"-- std:",float(torch.std((torch.stack(max_probs)))))
+
+                    # print("raw:",test_probs)
                     y_pred = torch.argmax(test_probs, axis=-1)
+                    # print(list(zip(y_pred[0:20],eval_dataset['label'][0:20])))
+
                     current_metric = {"eval_raw_first_shot": self._predict_metrics(y_pred, eval_dataset["label"]), "unsup_eval_raw_first_shot}":self.unsup_evaluator(test_embeds, test_probs, label_embeds, test_original_logits)}
                     print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-                    print(list(current_metric.keys())[1], "----- ", current_metric[list(current_metric.keys())[1]])
+                    # print(list(current_metric.keys())[1], "----- ", current_metric[list(current_metric.keys())[1]])
                     training_history.append(current_metric)
                     saving_tuple = (embeds, raw_probs, labels, test_embeds, test_probs, eval_dataset["label"])
-                    with open("dim_" + self.experiment_name + "_" + "full_train_raw_first_shot:" + '.pickle','wb') as handle:
-                        pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
+                    # with open("dim_" + self.experiment_name + "_" + "full_train_raw_first_shot:" + '.pickle','wb') as handle:
+                    #     pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
         else:
             # Throws error
             raise RuntimeError("ZeroBERTo training requires a first shot model")
+        
+        if self.model.first_shot_model and self.train_first_shot:
+            x_train, y_train = self._build_first_shot_dataset()
+            print(f'1st shot Dataset: {x_train}')
+            train_setfit_iteration(last_shot_body_epochs=5)
+            trained_probs, fs_trained_embeds = self.model.predict_proba(train_dataset["text"], return_embeddings=True)
+            print(f"1st shot - train and prediction time: {round(time.time()-t0,2)} seconds")
+            max_probs = ([max(probs) for probs in trained_probs])
+            last_mean = torch.mean(torch.stack(max_probs))
+            last_std = torch.std(torch.stack(max_probs))
 
-        samples_per_label_roadmap = self.var_samples_per_label if self.var_samples_per_label is not None else list(np.repeat(self.samples_per_label,num_setfit_iterations))
-        selection_strategy_roadmap = self.var_selection_strategy if self.var_selection_strategy else num_setfit_iterations*[None]
+            print("mean:",float(last_mean),"-- std:",float(last_std))
+            # TO DO: if demanded and train_dataset["label"], report metrics on the performance of the model on train set
+            if return_history and labels:
+                y_pred = torch.argmax(trained_probs, axis=-1)
+                current_metric = {f"full_train_trained_first_shot":self._predict_metrics(y_pred, labels)}
+                print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+                training_history.append(current_metric)
+                if eval_dataset and eval_labels:
+                    test_probs,test_embeds  = self.model.predict_proba(eval_dataset["text"], return_embeddings=True)
+                    # print(test_probs)
+                    y_pred = torch.argmax(test_probs, axis=-1)
+                    # print(list(zip(y_pred[0:20],eval_dataset['label'][0:20])))
+                    current_metric = {f"eval_trained_first_shot": self._predict_metrics(y_pred, eval_dataset["label"])}
+                    print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+                    training_history.append(current_metric)
+                    saving_tuple = (fs_trained_embeds, trained_probs, labels, test_embeds, test_probs, eval_dataset["label"])
+                    # with open("dim_" + self.experiment_name + "_" + "full_train_trained_first_shot" + '.pickle', 'wb') as handle:
+                    #     pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            # probs, embeds = self.model.first_shot_model(train_dataset["text"], return_embeddings=True)
+
+        print("Clustering all classes.")
+        fs_clusters = self.data_selector(None, None, embeds,
+                                                                                labels=labels,
+                                                                                n=1,
+                                                                                selection_strategy='first_shot')
+        
+        num_setfit_iterations = min(max(len(fs_clusters.unique()),2),5)
+
+        ### growth_rate
+        samples_per_label_roadmap = [self.starting_n]
+        for i in range(10):
+            samples_per_label_roadmap.append(samples_per_label_roadmap[-1]*growth_rate)
+        samples_per_label_roadmap = samples_per_label_roadmap[0:num_setfit_iterations]
+        print(samples_per_label_roadmap)
+        selection_strategy_roadmap = ((['tn','ic']*10)[0:num_setfit_iterations]) if self.selection_strategy == 'alternate' else ([self.selection_strategy]*num_setfit_iterations) 
+        print(selection_strategy_roadmap)
+        # samples_per_label_roadmap = self.var_samples_per_label if self.var_samples_per_label is not None else list(np.repeat(self.samples_per_label,num_setfit_iterations))
+        # selection_strategy_roadmap = self.var_selection_strategy if self.var_selection_strategy else num_setfit_iterations*[None]
 
         training_indices = []
         last_shot_training_data = []
@@ -346,103 +393,210 @@ class ZeroBERToTrainer(SetFitTrainer):
         # Iterations of setfit
         t0_setfit = time.time()
         probs = trained_probs if self.train_first_shot else raw_probs
-        for i in range(num_setfit_iterations):
-            print(f"********** Running SetFit Iteration {i+1} **********")
+
+
+        
+        for iteration,_ in enumerate(samples_per_label_roadmap):
+            print(f"********** Running SetFit Iteration {iteration+1} **********")
+            
             ti_setfit = time.time()
+            # if iteration!=0:
+            #     last_select_strat = selection_strategy_roadmap[iteration-1]
+            #     if last_select_strat == 'top_n' and iteration+1 < num_setfit_iterations:
+            #         self.model.reset_model_body()
+                
             x_train, y_train, labels_train, training_indices, probs_train = self.data_selector(train_dataset["text"], probs, embeds,
                                                                                   labels=labels,
-                                                                                  n=samples_per_label_roadmap[i],
-                                                                                  selection_strategy=selection_strategy_roadmap[i],
+                                                                                  n=samples_per_label_roadmap[iteration],
+                                                                                  selection_strategy=selection_strategy_roadmap[iteration],
                                                                                   discard_indices=[] if allow_resampling else training_indices)
+            # print(type(y_train),y_train)
+
+
+            # if self.train_first_shot:
+            #     x_train_fs, y_train_fs = self._build_first_shot_dataset()
+            #     x_train = x_train + x_train_fs
+            #     y_train = y_train + list(y_train_fs)
+            #     labels_train = labels_train + list(y_train_fs)
 
             print("Data Selected:", len(x_train))
-            last_shot_training_data.append(list(zip(x_train, y_train, labels_train, training_indices, probs_train)))
+            # last_shot_training_data.append(list(zip(x_train, y_train, labels_train, training_indices, probs_train)))
              # if demanded and train_dataset["label"], report metrics on the performance of the selection
             if return_history and labels:
-                current_metric = {f"data_selector-{i+1}":self._predict_metrics(y_train, labels_train)}
+                current_metric = {f"data_selector-{iteration+1}":self._predict_metrics(y_train, labels_train)}
                 print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
                 # Save data_selector_moment
-                data_selector_tuple = (probs, embeds, labels, selection_strategy_roadmap[i], [] if allow_resampling else training_indices, original_logits)
-                with open(self.experiment_name + "_" + f"data_selector-{i+1}" + '.pickle', 'wb') as handle:
+                data_selector_tuple = (probs, embeds, labels, selection_strategy_roadmap[iteration], [] if allow_resampling else training_indices, original_logits)
+                with open(self.experiment_name + "_" + f"data_selector-{iteration+1}" + '.pickle', 'wb') as handle:
                     pickle.dump(data_selector_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
                 training_history.append(current_metric)
             train_setfit_iteration()
             probs, new_embeds = self.model.predict_proba(train_dataset["text"], return_embeddings=True)
+
+            max_probs = ([max(probs) for probs in probs])
+            
+            this_mean = torch.mean(torch.stack(max_probs))
+            this_std = torch.std(torch.stack(max_probs))
+
+            print("mean:",float(this_mean),"-- std:",float(this_std))
             if update_embeddings:
                 embeds = new_embeds
             # TO DO: if demanded and train_dataset["label"], report metrics on the performance of the model on train set
             if return_history and labels:
                 y_pred = torch.argmax(probs, axis=-1)
                 _, label_embeds = self.model.predict_proba(self.model.first_shot_model.classes_list, return_embeddings=True)
-                current_metric = {f"full_train_setfit_iteration-{i+1}":self._predict_metrics(y_pred, labels), f"unsup_full_train_setfit_iteration-{i+1}":self.unsup_evaluator(new_embeds, probs, label_embeds, original_logits)}
+                current_metric = {f"full_train_setfit_iteration-{iteration+1}":self._predict_metrics(y_pred, labels), f"unsup_full_train_setfit_iteration-{iteration+1}":self.unsup_evaluator(new_embeds, probs, label_embeds, original_logits)}
                 print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
                 training_history.append(current_metric)
 
                 current_probs = self.model.predict_proba(x_train, return_embeddings=False)
                 current_pred = torch.argmax(current_probs, axis=-1)
-                current_metric = {f"cur_train_setfit_iteration-{i + 1}": self._predict_metrics(current_pred, labels_train)}
+
+                max_probs = ([max(probs) for probs in current_probs])
+
+                ds_last_mean = torch.mean(torch.tensor(max_probs))
+                ds_last_std = torch.std(torch.tensor(max_probs))
+
+                print("mean:",float(ds_last_mean),"-- std:",float(ds_last_std))
+                current_metric = {f"cur_train_setfit_iteration-{iteration+ 1}": self._predict_metrics(current_pred, labels_train)}
                 print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
                 training_history.append(current_metric)
+
+                fs_probs, fs_embeds, original_logits = self.model.first_shot_model(train_dataset["text"], return_embeddings=True, return_logits=True)
+
+                if return_history and labels:
+                    y_pred = torch.argmax(fs_probs, axis=-1)
+                    _, label_embeds = self.model.first_shot_model(self.model.first_shot_model.classes_list, return_embeddings=True)
+                    current_metric = {f"full_train_first_shot_iteration-{iteration+1}":self._predict_metrics(y_pred, labels), "unsup_full_train_raw_first_shot":self.unsup_evaluator(embeds, raw_probs, label_embeds, original_logits)}
+                    print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+                    # print(list(current_metric.keys())[1], "----- ",current_metric[list(current_metric.keys())[1]])
+                    training_history.append(current_metric)
+                    if eval_dataset and eval_labels:
+                        test_probs, test_embeds, test_original_logits = self.model.first_shot_model(eval_dataset["text"], return_embeddings=True, return_logits=True)
+                        max_probs = ([max(probs) for probs in test_probs])
+                        print("mean:",float(torch.mean(torch.stack(max_probs))),"-- std:",float(torch.std((torch.stack(max_probs)))))
+
+                        # print("raw:",test_probs)
+                        y_pred = torch.argmax(test_probs, axis=-1)
+                        # print(list(zip(y_pred[0:20],eval_dataset['label'][0:20])))
+
+                        current_metric = {f"eval_first_shot_iteration-{iteration+1}": self._predict_metrics(y_pred, eval_dataset["label"]), "unsup_eval_raw_first_shot}":self.unsup_evaluator(test_embeds, test_probs, label_embeds, test_original_logits)}
+                        print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+                        # print(list(current_metric.keys())[1], "----- ", current_metric[list(current_metric.keys())[1]])
+                        training_history.append(current_metric)
+                        saving_tuple = (embeds, raw_probs, labels, test_embeds, test_probs, eval_dataset["label"])
+                        # with open("dim_" + self.experiment_name + "_" + "full_train_raw_first_shot:" + '.pickle','wb') as handle:
+                        #     pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
                 if eval_dataset and eval_labels:
                     test_probs, test_embeds = self.model.predict_proba(eval_dataset["text"], return_embeddings=True)
+                    max_probs = ([max(probs) for probs in test_probs])
+                    
+                    eval_last_mean = torch.mean(torch.stack(max_probs))
+                    eval_last_std = torch.std(torch.stack(max_probs))
+
+                    print("mean:",float(eval_last_mean),"-- std:",float(eval_last_std))
                     y_pred = torch.argmax(test_probs, axis=-1)
-                    current_metric = {f"eval_setfit_iteration-{i+1}": self._predict_metrics(y_pred, eval_dataset["label"]), f"unsup_eval_setfit_iteration-{i+1}":self.unsup_evaluator(test_embeds, test_probs, label_embeds, test_original_logits)}
+                    current_metric = {f"eval_setfit_iteration-{iteration+1}": self._predict_metrics(y_pred, eval_dataset["label"]), f"unsup_eval_setfit_iteration-{iteration+1}":self.unsup_evaluator(test_embeds, test_probs, label_embeds, test_original_logits)}
                     print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
                     training_history.append(current_metric)
                     saving_tuple = (new_embeds, probs, labels, test_embeds, test_probs, eval_dataset["label"])
-                    with open("dim_" + self.experiment_name + "_" + f"full_train_setfit_iteration-{i+1}" + '.pickle','wb') as handle:
+                    with open("dim_" + self.experiment_name + "_" + f"full_train_setfit_iteration-{iteration+1}" + '.pickle','wb') as handle:
                         pickle.dump(saving_tuple, handle, protocol=pickle.HIGHEST_PROTOCOL)
             # TO DO: if test_dataset, report metrics on the performance of the model on test set
-            if reset_model_head and i+1 < num_setfit_iterations:
+            if reset_model_head and iteration+1 < num_setfit_iterations:
                 self.model.reset_model_head()
-            print(f"Iteration {i+1} time: {round(time.time()-ti_setfit,2)}")
+            
+            # print(this_mean,last_mean,growth_threshold)
+            # if iteration==0:
+            #     n_to_add = self.starting_n+1
 
+            # elif float(this_mean) < float(last_mean)-growth_threshold:
+            #     state = 4
+            #     print(f"State {state}: Hard stop to prevent overfitting.")
+            #     self.data_selector.keep_training = False
 
+            # elif float(this_mean) > float(last_mean)+growth_threshold and float(this_std) < float(last_std)+growth_threshold:
+            #     state = 5
+            #     print(f"State {state}: Cautious.")
+            #     n_to_add = samples_per_label_roadmap[-1] * (1/(self.growth_rate))
+            #     samples_per_label_roadmap.append(int(n_to_add))
+                
 
+            # elif float(this_mean) < float(last_mean)+growth_threshold or float(this_std) < float(last_std)+growth_threshold:
+            #     state = 3
+            #     print(f"State {state}: Not learning enough.")
+            #     n_to_add = samples_per_label_roadmap[-1] * (1/(self.growth_rate)**2)
+            #     samples_per_label_roadmap.append(int(n_to_add))
 
-        print(f"********** Running Last Shot **********") ##########################
+            # elif float(this_mean) < float(last_mean):
+            #     state=2
+            #     print(f"State {state}: Cautious.")
+            #     n_to_add = samples_per_label_roadmap[-1]
+            #     samples_per_label_roadmap.append(int(n_to_add))
+            # else:
+            #     state = 1
+            #     print(f"State {state}: Adding more data.")
+            #     n_to_add = samples_per_label_roadmap[-1] * (self.growth_rate)
+            #     samples_per_label_roadmap.append(int(n_to_add))
 
-        self.model.reset_model_body(self.model.first_shot_model.embedding_model)
+            # last_mean = this_mean
+            # last_std = this_std
+            # if n_to_add <= self.starting_n:
+            #     self.data_selector.keep_training = False
 
-        t0_lastshot = time.time()
+            print(f"Iteration {iteration+1} time: {round(time.time()-ti_setfit,2)}")
 
-        x_train, y_train, labels_train, training_indices, probs_train = self.data_selector(train_dataset["text"], probs, embeds,
-                                                                        labels=labels,
-                                                                        n=32,
-                                                                        selection_strategy='top_n',
-                                                                        discard_indices=[] if allow_resampling else training_indices)
-        print("Data Selected:",len(x_train))
+            if not self.data_selector.keep_training:
+                print(f"Training stopped because stop criteria was met.")
+                break
 
-        # last_shot_training_data.append(list(zip(x_train, y_train, labels_train, training_indices, probs_train)))
-            # if demanded and train_dataset["label"], report metrics on the performance of the selection
-        if return_history and labels:
-            current_metric = {f"last_shot_data_selector":self._predict_metrics(y_train, labels_train)}
-            print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+            print(f"Updated roadmap: {samples_per_label_roadmap}")
+        
 
-            training_history.append(current_metric)
-        train_setfit_iteration(last_shot_body_epochs=2,last_shot_head_epochs=2,last_shot_body_learning_rate=1e-4)
-        probs, new_embeds = self.model.predict_proba(train_dataset["text"], return_embeddings=True)
-        if update_embeddings:
-            embeds = new_embeds
-        print(f"Last Shot time: {round(time.time()-t0_lastshot,2)}")
-        if return_history and labels:
-            y_pred = torch.argmax(probs, axis=-1)
-            current_metric = {f"full_train_last_shot":self._predict_metrics(y_pred, labels)}
-            print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-            training_history.append(current_metric)
+        # print(f"********** Running Last Shot **********") ##########################
 
-            current_probs = self.model.predict_proba(x_train, return_embeddings=False)
-            current_pred = torch.argmax(current_probs, axis=-1)
-            current_metric = {f"cur_train_last_shot": self._predict_metrics(current_pred, labels_train)}
-            print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-            training_history.append(current_metric)
-            if eval_dataset and eval_labels:
-                test_probs = self.model.predict_proba(eval_dataset["text"], return_embeddings=False)
-                y_pred = torch.argmax(test_probs, axis=-1)
-                current_metric = {f"eval_last_shot": self._predict_metrics(y_pred, eval_dataset["label"])}
-                print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
-                training_history.append(current_metric)
+        # self.model.reset_model_body(self.model.first_shot_model.embedding_model)
+
+        # t0_lastshot = time.time()
+
+        # x_train, y_train, labels_train, training_indices, probs_train = self.data_selector(train_dataset["text"], probs, embeds,
+        #                                                                 labels=labels,
+        #                                                                 n=32,
+        #                                                                 selection_strategy='top_n',
+        #                                                                 discard_indices=[] if allow_resampling else training_indices)
+        # print("Data Selected:",len(x_train))
+
+        # # last_shot_training_data.append(list(zip(x_train, y_train, labels_train, training_indices, probs_train)))
+        #     # if demanded and train_dataset["label"], report metrics on the performance of the selection
+        # if return_history and labels:
+        #     current_metric = {f"last_shot_data_selector":self._predict_metrics(y_train, labels_train)}
+        #     print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+
+        #     training_history.append(current_metric)
+        # train_setfit_iteration(last_shot_body_epochs=2,last_shot_head_epochs=2,last_shot_body_learning_rate=1e-4)
+        # probs, new_embeds = self.model.predict_proba(train_dataset["text"], return_embeddings=True)
+        # if update_embeddings:
+        #     embeds = new_embeds
+        # print(f"Last Shot time: {round(time.time()-t0_lastshot,2)}")
+        # if return_history and labels:
+        #     y_pred = torch.argmax(probs, axis=-1)
+        #     current_metric = {f"full_train_last_shot":self._predict_metrics(y_pred, labels)}
+        #     print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+        #     training_history.append(current_metric)
+
+        #     current_probs = self.model.predict_proba(x_train, return_embeddings=False)
+        #     current_pred = torch.argmax(current_probs, axis=-1)
+        #     current_metric = {f"cur_train_last_shot": self._predict_metrics(current_pred, labels_train)}
+        #     print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+        #     training_history.append(current_metric)
+        #     if eval_dataset and eval_labels:
+        #         test_probs = self.model.predict_proba(eval_dataset["text"], return_embeddings=False)
+        #         y_pred = torch.argmax(test_probs, axis=-1)
+        #         current_metric = {f"eval_last_shot": self._predict_metrics(y_pred, eval_dataset["label"])}
+        #         print(list(current_metric.keys())[0], "----- accuracy:",current_metric[list(current_metric.keys())[0]]['weighted']['accuracy'])
+        #         training_history.append(current_metric)
 
         return training_history if return_history else None
 
@@ -469,6 +623,5 @@ class ZeroBERToTrainer(SetFitTrainer):
     def _build_first_shot_dataset(self):
         x_train = [self.model.first_shot_model.hypothesis_template.format(cl) for cl in self.model.first_shot_model.classes_list]
         y_train = np.arange(len(self.model.first_shot_model.classes_list))
-        print(x_train,y_train)
         return x_train, y_train
 
